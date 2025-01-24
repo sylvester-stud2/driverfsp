@@ -16,6 +16,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
 
     <style>
+
         * {
             margin: 0;
             padding: 0;
@@ -688,6 +689,48 @@
     50% { transform: translateX(5px); }
     100% { transform: translateX(-5px); }
 }
+
+
+
+
+.follow-button {
+    padding: 8px 12px;
+    border: none;
+    background: white;
+    box-shadow: 0 0 0 2px rgba(0,0,0,.1);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+}
+
+.follow-button.active {
+    background: #000000;
+    color: #FFD700;
+}
+
+.follow-button:hover {
+    background: #f4f4f4;
+}
+
+.follow-button.active:hover {
+    background: #1a1a1a;
+}
+
+.follow-button i {
+    font-size: 16px;
+}
+
+/* Position the follow button in a better spot */
+.mapboxgl-ctrl-group.follow-button {
+    position: absolute;
+    top: 80px;
+    right: 10px;
+    z-index: 1;
+}
     </style>
 </head>
 <body>
@@ -751,6 +794,8 @@ let watchPositionId = null;
 let updateInterval = null;
 let routeUpdateInterval = null;
 let unsubscribeOrders = null;
+let isFollowingDriver = true; // Start with following mode enabled
+let userInteractingWithMap = false;
 
 // Constants
 const STORE_LOCATION = [29.4029, -23.8646]; // [longitude, latitude]
@@ -760,6 +805,16 @@ const LOCATION_SETTINGS = {
     maximumAge: 2000
 };
 
+function toggleFollowMode() {
+    isFollowingDriver = !isFollowingDriver;
+    const followButton = document.getElementById('follow-toggle');
+    if (followButton) {
+        followButton.classList.toggle('active', isFollowingDriver);
+        followButton.innerHTML = isFollowingDriver ? 
+            '<i class="fas fa-location-arrow"></i> Following' : 
+            '<i class="fas fa-location"></i> Follow';
+    }
+}
 // Initialize map
 function initializeMap() {
     mapboxgl.accessToken = 'pk.eyJ1Ijoic3lsdmVzdGVyMzMiLCJhIjoiY200a2JsdDJyMG02NjJrc2xzMG40b25wOSJ9.6MP3EOP-rPYvNIoe9UUxlA';
@@ -774,6 +829,26 @@ function initializeMap() {
         antialias: true
     });
 
+    // Add follow mode toggle button
+    const followButton = document.createElement('button');
+    followButton.id = 'follow-toggle';
+    followButton.className = 'mapboxgl-ctrl-group mapboxgl-ctrl follow-button active';
+    followButton.innerHTML = '<i class="fas fa-location-arrow"></i> Following';
+    followButton.onclick = toggleFollowMode;
+
+    const customControl = document.createElement('div');
+    customControl.className = 'mapboxgl-ctrl mapboxgl-ctrl-group';
+    customControl.appendChild(followButton);
+    map.addControl({ 
+        onAdd: function() {
+            return customControl;
+        },
+        onRemove: function() {
+            customControl.parentNode.removeChild(customControl);
+        }
+    });
+
+    // Add standard navigation controls
     map.addControl(new mapboxgl.NavigationControl());
 
     // Add store marker
@@ -781,6 +856,21 @@ function initializeMap() {
         .setLngLat(STORE_LOCATION)
         .setPopup(new mapboxgl.Popup().setHTML('<h3>Store Location</h3><p>Pickup Point</p>'))
         .addTo(map);
+
+    // Track user interaction with map
+    map.on('dragstart', () => {
+        userInteractingWithMap = true;
+        isFollowingDriver = false;
+        followButton.classList.remove('active');
+        followButton.innerHTML = '<i class="fas fa-location"></i> Follow';
+    });
+
+    // Re-enable follow mode after 10 seconds of no interaction
+    map.on('dragend', () => {
+        setTimeout(() => {
+            userInteractingWithMap = false;
+        }, 10000);
+    });
 
     map.on('load', () => {
         map.addLayer({
@@ -810,6 +900,8 @@ function initializeMap() {
             }
         });
     });
+
+    return map;
 }
 
 // Create enhanced driver marker element
@@ -1195,17 +1287,6 @@ function generateChatButton(orderId) {
 
 // Enhanced update driver location function
 function updateDriverLocation(position) {
-
-    // Test log
-    console.log('🚗 Location Update Received:', new Date().toLocaleTimeString(), {
-        latitude: position?.coords?.latitude,
-        longitude: position?.coords?.longitude,
-        accuracy: position?.coords?.accuracy
-    });
-
-
-
-
     if (!position?.coords) {
         console.error('Invalid position data received');
         return;
@@ -1213,30 +1294,23 @@ function updateDriverLocation(position) {
 
     const { latitude, longitude, accuracy, heading, speed } = position.coords;
     const timestamp = new Date().toISOString();
+    const newLocation = [longitude, latitude];
 
     if (!isValidCoordinate(latitude, longitude)) {
         console.error('Invalid coordinates received:', { latitude, longitude });
         return;
     }
 
-    const newLocation = [longitude, latitude];
-    console.log('Position update:', {
-        timestamp,
-        coords: newLocation,
-        accuracy: `${accuracy}m`,
-        heading,
-        speed
-    });
-
     // Remove existing marker if it exists
     if (driverMarker) {
         driverMarker.remove();
     }
 
-    // Create new marker with enhanced style
+    // Create new marker
     driverMarker = new mapboxgl.Marker({
         element: createDriverMarkerElement(),
-        anchor: 'center'
+        anchor: 'center',
+        rotation: heading || 0 // Use heading for marker rotation
     })
     .setLngLat(newLocation)
     .setPopup(new mapboxgl.Popup({
@@ -1250,6 +1324,21 @@ function updateDriverLocation(position) {
         ${heading ? `<p>Heading: ${heading.toFixed(1)}°</p>` : ''}
     `))
     .addTo(map);
+
+    // Update map view if following is enabled
+    if (isFollowingDriver && !userInteractingWithMap) {
+        // Calculate target bearing based on movement
+        const targetBearing = heading || map.getBearing();
+        
+        // Smoothly move the map
+        map.easeTo({
+            center: newLocation,
+            bearing: targetBearing,
+            duration: 1000,
+            pitch: 60, // Increased pitch for better navigation view
+            essential: true // This animation is considered essential for navigation
+        });
+    }
 
     updateDriverLocationInFirestore(newLocation, timestamp, {
         accuracy,
