@@ -796,6 +796,11 @@ let routeUpdateInterval = null;
 let unsubscribeOrders = null;
 let isFollowingDriver = true; // Start with following mode enabled
 let userInteractingWithMap = false;
+let currentRoute = null;
+let currentStepIndex = 0; 
+let currentStep = 0;
+let speech = null;
+let isMuted = false;
 
 // Constants
 const STORE_LOCATION = [29.4029, -23.8646]; // [longitude, latitude]
@@ -902,6 +907,123 @@ function initializeMap() {
     });
 
     return map;
+}
+function initializeSpeech() {
+    speech = new SpeechSynthesisUtterance();
+    speech.lang = 'en-GB'; // Use British English for better pronunciation
+    speech.volume = 1;
+    speech.rate = 1;
+    speech.pitch = 1;
+}
+
+// Add sound controls to the map
+function addSoundControls() {
+    const soundButton = document.createElement('button');
+    soundButton.id = 'sound-toggle';
+    soundButton.className = 'mapboxgl-ctrl-group mapboxgl-ctrl sound-button active';
+    soundButton.innerHTML = '<i class="fas fa-volume-up"></i>';
+    soundButton.onclick = toggleSound;
+
+    const customControl = document.createElement('div');
+    customControl.className = 'mapboxgl-ctrl mapboxgl-ctrl-group';
+    customControl.appendChild(soundButton);
+    map.addControl({ 
+        onAdd: function() {
+            return customControl;
+        },
+        onRemove: function() {
+            customControl.parentNode.removeChild(customControl);
+        }
+    });
+}
+
+// Toggle sound on/off
+function toggleSound() {
+    isMuted = !isMuted;
+    const soundButton = document.getElementById('sound-toggle');
+    soundButton.innerHTML = isMuted ? 
+        '<i class="fas fa-volume-mute"></i>' : 
+        '<i class="fas fa-volume-up"></i>';
+    soundButton.classList.toggle('active', !isMuted);
+}
+
+// Speak navigation instruction
+function speakInstruction(text) {
+    if (isMuted || !text || !speech) return;
+    
+    try {
+        window.speechSynthesis.cancel();  // Cancel any ongoing speech
+        speech.text = text;
+        window.speechSynthesis.speak(speech);
+    } catch (error) {
+        console.error('Speech synthesis error:', error);
+        // Fallback to visual notification if speech fails
+    }
+}
+// Get clean navigation instruction
+function cleanInstruction(instruction) {
+    // Remove HTML tags and simplify common terms
+    return instruction
+        .replace(/<[^>]*>/g, '')
+        .replace('Take the rotary', 'At the roundabout')
+        .replace('Take the', 'Take')
+        .replace(/(\d+)\s*meters/g, '$1 meters')
+        .replace(/(\d+)\s*kilometers/g, '$1 kilometers');
+}
+
+// Calculate distance between two points
+function calculateDistance(point1, point2) {
+    const lat1 = point1[1];
+    const lon1 = point1[0];
+    const lat2 = point2[1];
+    const lon2 = point2[0];
+    
+    const R = 6371e3; // Earth's radius in meters
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c; // Distance in meters
+}
+function resetNavigationState() {
+    currentStepIndex = 0;
+    if (currentRoute) {
+        currentRoute.legs[0].steps.forEach(step => {
+            step.announced400 = false;
+            step.announced100 = false;
+        });
+    }
+}
+// Update navigation based on current position
+function updateNavigation(currentLocation) {
+    if (!currentRoute || currentStepIndex >= currentRoute.legs[0].steps.length) return;
+    
+    const currentStep = currentRoute.legs[0].steps[currentStepIndex];
+    const nextManeuverPoint = currentStep.maneuver.location;
+    const distanceToManeuver = calculateDistance(currentLocation, nextManeuverPoint);
+    
+    if (distanceToManeuver <= 50) {
+        // Move to next step
+        currentStepIndex++;
+        if (currentStepIndex < currentRoute.legs[0].steps.length) {
+            const nextStep = currentRoute.legs[0].steps[currentStepIndex];
+            nextStep.announced400 = false;
+            nextStep.announced100 = false;
+            speakInstruction('Now, ' + cleanInstruction(nextStep.maneuver.instruction));
+        }
+    } else if (distanceToManeuver <= 100 && !currentStep.announced100) {
+        speakInstruction(cleanInstruction(currentStep.maneuver.instruction));
+        currentStep.announced100 = true;
+    } else if (distanceToManeuver <= 400 && !currentStep.announced400) {
+        speakInstruction(`In ${Math.round(distanceToManeuver)} meters, ${cleanInstruction(currentStep.maneuver.instruction)}`);
+        currentStep.announced400 = true;
+    }
 }
 
 // Create enhanced driver marker element
@@ -1301,6 +1423,10 @@ function updateDriverLocation(position) {
         return;
     }
 
+    if (currentRoute) {
+        updateNavigation(newLocation);
+    }
+
     // Remove existing marker if it exists
     if (driverMarker) {
         driverMarker.remove();
@@ -1480,8 +1606,8 @@ async function updateRouteFromDriver(driverLocation, deliveryLocation) {
         }
 
         const data = await response.json();
-        const route = data.routes[0].geometry.coordinates;
-
+        currentRoute = data.routes[0];
+        currentStepIndex = 0
         // Remove existing route
         if (map.getLayer('route')) {
             map.removeLayer('route');
@@ -1489,7 +1615,15 @@ async function updateRouteFromDriver(driverLocation, deliveryLocation) {
         if (map.getSource('route')) {
             map.removeSource('route');
         }
-
+        
+        
+        currentRoute.legs[0].steps.forEach(step => {
+            step.announced400 = false;
+            step.announced100 = false;
+        });
+        // Speak initial instruction
+        const firstStep = currentRoute.legs[0].steps[0];
+        speakInstruction(cleanInstruction(firstStep.maneuver.instruction));
         // Add new route
         map.addSource('route', {
             type: 'geojson',
@@ -1498,7 +1632,7 @@ async function updateRouteFromDriver(driverLocation, deliveryLocation) {
                 properties: {},
                 geometry: {
                     type: 'LineString',
-                    coordinates: route
+                    coordinates: data.geometry.coordinates
                 }
             }
         });
@@ -2199,6 +2333,7 @@ auth.onAuthStateChanged((user) => {
 
 // Add event listeners for form submission
 document.addEventListener('DOMContentLoaded', () => {
+    initializeSpeech();
     const emailInput = document.getElementById('email');
     const passwordInput = document.getElementById('password');
 
